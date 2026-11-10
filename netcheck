@@ -1,0 +1,1388 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  netcheck — a field checklist for a network you just met
+# ============================================================================
+#
+#  For travel days: land on a network, work down the list, leave with a report.
+#
+#    netcheck                  interactive checklist
+#    netcheck --all            run steps 1-7 without prompts
+#    netcheck --quick          steps 1-4 only (where am I / link / hosts / path)
+#    netcheck --step 5         run a single step
+#    netcheck --step 5 --target 10.0.0.1
+#    netcheck --step 3 --subnet 192.168.1.0/24
+#    netcheck --step 5 --full  scan all 65535 TCP ports (slow)
+#    netcheck --step 5 --ports 1-1024
+#
+#  Reports: ~/netcheck-reports/<timestamp>-<pid>/report.md (+ raw.log)
+#
+#  Only scan networks you own or have permission to test.
+# ============================================================================
+
+set -uo pipefail
+umask 077
+
+VERSION="1.0"
+SELF="${0##*/}"
+
+REPORT_ROOT="${NETCHECK_REPORTS:-$HOME/netcheck-reports}"
+OUT=""
+RAW=""
+BODY=""
+REPORT=""
+
+ASSUME_YES=0
+INTERACTIVE=0
+RUN_ALL=0
+QUICK=0
+FULL_SCAN=0
+STEP_ARG=""
+TARGET_ARG=""
+SUBNET_ARG=""
+PORTS_ARG=""
+USE_COLOR=1
+REPORT_PRINTED=0
+
+declare -a FINDINGS=()
+declare -a HOST_IPS=()
+declare -a HOST_NAMES=()
+declare -a HOST_MACS=()
+LAST_SCAN_HOST=""
+
+COMMON_PORTS=(21 22 23 25 53 80 110 139 143 443 445 587 993 995 \
+              1433 1521 2049 3306 3389 5432 5900 6379 8080 8443 9200 27017)
+
+# ---------------------------------------------------------------- presentation
+
+setup_colors() {
+    if [[ $USE_COLOR == 1 && -t 1 && -z ${NO_COLOR:-} ]]; then
+        B=$'\e[1m'; DIM=$'\e[2m'
+        RED=$'\e[31m'; GREEN=$'\e[32m'; YELLOW=$'\e[33m'
+        BLUE=$'\e[34m'; MAG=$'\e[35m'; CYAN=$'\e[36m'; RST=$'\e[0m'
+    else
+        B=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; MAG=""; CYAN=""; RST=""
+    fi
+}
+
+hr() { printf '%s\n' "${DIM}────────────────────────────────────────────────────────────────────${RST}"; }
+
+banner() {
+    printf '\n%s  netcheck %s%s — field checklist for a network you just met\n' "$B$CYAN" "$VERSION" "$RST"
+    printf '%s  scans are active traffic: only use this where you are authorised%s\n' "$DIM" "$RST"
+}
+
+h1() {
+    printf '\n%s\n' "${B}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+    printf '%s  %s%s\n' "$B$BLUE" "$*" "$RST"
+    printf '%s\n' "${B}${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+}
+
+h2() { printf '\n%s▸ %s%s\n' "$B$CYAN" "$*" "$RST"; }
+
+kv() { printf '  %-22s %s\n' "$1" "$2"; }
+
+info() { printf '  %s%s%s\n' "$CYAN" "$*" "$RST"; }
+good() { printf '  %s✔ %s%s\n' "$GREEN" "$*" "$RST"; }
+warn() { printf '  %s! %s%s\n' "$YELLOW" "$*" "$RST"; }
+bad()  { printf '  %s✘ %s%s\n' "$RED" "$*" "$RST"; }
+note() { printf '  %s· %s%s\n' "$DIM" "$*" "$RST"; }
+
+ask() {
+    local prompt=$1 default=${2-} answer
+    if (( ! INTERACTIVE )); then
+        printf '%s' "$default"
+        return 0
+    fi
+    if [[ -n $default ]]; then
+        read -rp "  ${B}${prompt}${RST} [$default]: " answer || return 1
+    else
+        read -rp "  ${B}${prompt}${RST}: " answer || return 1
+    fi
+    printf '%s' "${answer:-$default}"
+}
+
+confirm() {
+    (( ASSUME_YES || ! INTERACTIVE )) && return 0
+    local prompt=$1 answer
+    read -rp "  ${B}${prompt}${RST} [Y/n]: " answer || return 1
+    [[ -z $answer || $answer == [Yy]* ]]
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+my_hostname() {
+    local h
+    h=$(uname -n 2>/dev/null || true)
+    [[ -z $h || $h == "(none)" ]] && h=$(cat /etc/hostname 2>/dev/null || true)
+    printf '%s' "${h:-unknown}"
+}
+
+safe() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# ---------------------------------------------------------------- logging
+
+md() { printf '%s\n' "$*" >> "$BODY"; }
+
+run_show() {
+    local cmd_str="$*"
+    printf '  %s$ %s%s\n' "$DIM" "$cmd_str" "$RST"
+    printf '\n$ %s\n' "$cmd_str" >> "$RAW"
+    "$@" 2>&1 | tee -a "$RAW"
+    return "${PIPESTATUS[0]}"
+}
+
+add_finding() {
+    local sev=$1 text=$2 why=${3:-} f
+    for f in "${FINDINGS[@]:-}"; do
+        [[ $f == "$sev|$text|$why" ]] && return 0
+    done
+    FINDINGS+=("$sev|$text|$why")
+}
+
+# ---------------------------------------------------------------- report
+
+init_report() {
+    OUT="$REPORT_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+    if ! mkdir -p "$OUT"; then
+        printf 'Cannot create %s\n' "$OUT" >&2
+        exit 1
+    fi
+    RAW="$OUT/raw.log"
+    BODY="$OUT/body.md"
+    REPORT="$OUT/report.md"
+    : > "$RAW"
+    : > "$BODY"
+}
+
+write_report() {
+    [[ -n $OUT ]] || return 0
+    local tmp="$OUT/.report.$$" sub gw f s t w sev
+    {
+        printf '# Network field report\n\n'
+        printf -- '- **When:** %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf -- '- **Host:** %s (%s)\n' "$(my_hostname)" "$(id -un 2>/dev/null || echo unknown)"
+        printf -- '- **System:** %s\n' "$(uname -srm)"
+        sub=$(primary_subnet 2>/dev/null || true)
+        [[ -n $sub ]] && printf -- '- **Local subnet:** %s\n' "$sub"
+        gw=$(get_gateway 2>/dev/null || true)
+        [[ -n $gw ]] && printf -- '- **Gateway:** %s\n' "$gw"
+        printf '\n'
+        cat "$BODY" 2>/dev/null
+        printf '\n## Findings\n\n'
+        if ((${#FINDINGS[@]})); then
+            printf '| Severity | Finding | Why it matters |\n|---|---|---|\n'
+            for sev in HIGH MEDIUM LOW INFO; do
+                for f in "${FINDINGS[@]}"; do
+                    [[ ${f%%|*} == "$sev" ]] || continue
+                    IFS='|' read -r s t w <<< "$f"
+                    printf '| %s | %s | %s |\n' "$s" "$t" "$w"
+                done
+            done
+        else
+            printf '_No findings recorded._\n'
+        fi
+        printf '\n## Next steps\n\n'
+        printf -- '- [ ] Confirm every open port above is expected, owned and patched.\n'
+        printf -- '- [ ] Replace cleartext services (telnet, ftp, http) with TLS variants or turn them off.\n'
+        printf -- '- [ ] Keep management interfaces (SSH, router UI, databases) behind a VPN or ACL.\n'
+        printf -- '- [ ] Check the gateway firmware and change any default admin password.\n'
+        printf -- '- [ ] Re-run netcheck after changes and diff the two reports.\n'
+        printf '\n---\n\nRaw command output: `%s`\n' "$RAW"
+    } > "$tmp"
+    mv "$tmp" "$REPORT"
+}
+
+finalize_report() {
+    local rc=$?
+    if [[ -n $OUT && -d $OUT ]]; then
+        write_report
+        if (( ! REPORT_PRINTED )); then
+            printf '\n%sReport:%s %s\n' "$B" "$RST" "$REPORT"
+            printf '%sRaw output:%s %s\n' "$DIM" "$RST" "$OUT"
+            REPORT_PRINTED=1
+        fi
+    fi
+    return $rc
+}
+
+# ---------------------------------------------------------------- net helpers
+
+get_gateway() {
+    ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}'
+}
+
+get_subnets() {
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $2, $4}'
+}
+
+is_virtual_iface() {
+    case $1 in
+        lo|tun*|tap*|docker*|veth*|br-*|virbr*|ifb*|dummy*|rmnet*|r_rmnet*|sit*|ip6tnl*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+primary_subnet() {
+    local iface cidr first=""
+    while read -r iface cidr; do
+        [[ -z $cidr ]] && continue
+        [[ -z $first ]] && first=$cidr
+        if ! is_virtual_iface "$iface"; then
+            printf '%s' "$cidr"
+            return 0
+        fi
+    done < <(get_subnets)
+    printf '%s' "$first"
+}
+
+port_open() {
+    local host=$1 port=$2 timeout_s=${3:-2}
+    timeout "$timeout_s" bash -c ": </dev/tcp/$host/$port" 2>/dev/null
+}
+
+tcp_probe() {
+    local h=$1 p
+    for p in 22 80 443 445 3389 8080; do
+        timeout 0.4 bash -c ": </dev/tcp/$h/$p" 2>/dev/null && return 0
+    done
+    return 1
+}
+export -f tcp_probe
+
+# Some sandboxes (proot, transparent proxies) accept every connect(). Probe a
+# reserved TEST-NET address first: if that looks open, TCP results are useless.
+tcp_usable() {
+    [[ -n ${TCP_OK:-} ]] && return "$TCP_OK"
+    if port_open 192.0.2.1 9 1; then
+        TCP_OK=1
+    else
+        TCP_OK=0
+    fi
+    return "$TCP_OK"
+}
+
+ping_usable() {
+    [[ -n ${PING_OK:-} ]] && return "$PING_OK"
+    if have ping && ping -c 1 -W 1 127.0.0.1 >/dev/null 2>&1; then
+        PING_OK=0
+    else
+        PING_OK=1
+    fi
+    return "$PING_OK"
+}
+
+nmap_usable() {
+    [[ -n ${NMAP_OK:-} ]] && return "$NMAP_OK"
+    if have nmap && nmap -n -sn 127.0.0.1 2>/dev/null | grep -q '1 host up'; then
+        NMAP_OK=0
+    else
+        NMAP_OK=1
+    fi
+    return "$NMAP_OK"
+}
+
+ip2int() {
+    local IFS=. a b c d
+    read -r a b c d <<< "$1"
+    echo $(( (a << 24) | (b << 16) | (c << 8) | d ))
+}
+
+int2ip() {
+    echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+
+cidr_size() {
+    [[ $1 == */* ]] || { echo 1; return; }
+    local p=${1#*/}
+    (( p >= 31 )) && { echo 1; return; }
+    echo $(( 1 << (32 - p) ))
+}
+
+cidr_hosts() {
+    local cidr=$1 max=${2:-254}
+    [[ $cidr == */* ]] || { echo "$cidr"; return; }
+    local ip=${cidr%/*} prefix=${cidr#*/} size count start i
+    (( prefix >= 31 )) && { echo "$ip"; return; }
+    size=$(( 1 << (32 - prefix) ))
+    count=$(( size - 2 ))
+    (( count > max )) && count=$max
+    start=$(( ($(ip2int "$ip") & ~(size - 1) & 0xFFFFFFFF) + 1 ))
+    for (( i = 0; i < count; i++ )); do
+        int2ip $(( start + i ))
+    done
+}
+
+rev_name() { timeout 3 getent hosts "$1" 2>/dev/null | awk 'NR==1 {print $2}'; }
+export -f rev_name
+
+neigh_mac() {
+    ip neigh show "$1" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="lladdr") {print $(i+1); exit}}'
+}
+
+port_service() {
+    case $1 in
+        21) echo ftp ;;        22) echo ssh ;;         23) echo telnet ;;
+        25) echo smtp ;;       53) echo dns ;;         80) echo http ;;
+        110) echo pop3 ;;      139) echo netbios-ssn ;; 143) echo imap ;;
+        443) echo https ;;     445) echo microsoft-ds ;; 587) echo submission ;;
+        993) echo imaps ;;     995) echo pop3s ;;      1433) echo ms-sql ;;
+        1521) echo oracle ;;   2049) echo nfs ;;       3306) echo mysql ;;
+        3389) echo rdp ;;      5432) echo postgresql ;; 5900) echo vnc ;;
+        6379) echo redis ;;    8080) echo http-alt ;;  8443) echo https-alt ;;
+        9200) echo elasticsearch ;; 27017) echo mongodb ;;
+        *) echo unknown ;;
+    esac
+}
+
+# severity|why
+port_risk() {
+    case $1 in
+        23|21|69|512|513|514)
+            echo "HIGH|cleartext protocol: credentials and data travel in the clear" ;;
+        445|139)
+            echo "HIGH|SMB file sharing: classic ransomware and credential-theft target" ;;
+        3389)
+            echo "HIGH|RDP exposed: brute-force and remote-code-execution target" ;;
+        5900|5901)
+            echo "HIGH|VNC exposed: frequently unauthenticated" ;;
+        2375|2376)
+            echo "HIGH|Docker API: full host takeover if unauthenticated" ;;
+        3306|5432|1433|1521|27017|6379|9200|11211)
+            echo "MEDIUM|database/cache port reachable: check bind address and auth" ;;
+        80|8000|8080|8888)
+            echo "MEDIUM|HTTP without TLS: traffic can be read or modified" ;;
+        161)
+            echo "MEDIUM|SNMP: default community strings are common" ;;
+        111)
+            echo "MEDIUM|rpcbind: enumerate with rpcinfo -p" ;;
+        22)
+            echo "INFO|SSH is exposed: normal, but check auth methods in step 6" ;;
+        443|8443)
+            echo "INFO|HTTPS: check certificate and TLS versions in step 6" ;;
+        53)
+            echo "INFO|DNS: test whether it is an open resolver in step 6" ;;
+        *)
+            echo "INFO|open service: confirm it is expected" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- discovery
+
+parse_discovery() {
+    local file=$1 line ip name mac vendor i
+    HOST_IPS=(); HOST_NAMES=(); HOST_MACS=()
+    [[ -f $file ]] || return 0
+    while IFS= read -r line; do
+        if [[ $line =~ ^Host:\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\ \(([^\)]*)\).*Status:\ Up ]]; then
+            HOST_IPS+=("${BASH_REMATCH[1]}")
+            HOST_NAMES+=("${BASH_REMATCH[2]}")
+            HOST_MACS+=("")
+        elif [[ $line =~ ^Host:\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*MAC\ Address:\ ([0-9A-Fa-f:]+)\ \((.*)\) ]]; then
+            ip=${BASH_REMATCH[1]}; mac=${BASH_REMATCH[2]}; vendor=${BASH_REMATCH[3]}
+            for i in "${!HOST_IPS[@]}"; do
+                [[ ${HOST_IPS[i]} == "$ip" ]] && HOST_MACS[i]="$mac ($vendor)"
+            done
+        fi
+    done < "$file"
+}
+
+fill_names() {
+    local i ip n
+    local -a todo=()
+    for i in "${!HOST_IPS[@]}"; do
+        [[ -n ${HOST_NAMES[i]:-} ]] && continue
+        todo+=("${HOST_IPS[i]}")
+    done
+    ((${#todo[@]})) || return 0
+    while IFS=$'\t' read -r ip n; do
+        [[ -n $ip ]] || continue
+        for i in "${!HOST_IPS[@]}"; do
+            [[ ${HOST_IPS[i]} == "$ip" ]] && HOST_NAMES[i]=${n:-}
+        done
+    done < <(printf '%s\n' "${todo[@]}" | xargs -P 16 -n 1 bash -c 'n=$(rev_name "$0"); printf "%s\t%s\n" "$0" "$n"')
+}
+
+sweep_ping() {
+    local cidr=$1
+    local -a ips=() alive=()
+    mapfile -t ips < <(cidr_hosts "$cidr" 1024)
+    info "Pinging ${#ips[@]} addresses in parallel..."
+    mapfile -t alive < <(printf '%s\n' "${ips[@]}" | xargs -P 64 -n 1 bash -c 'ping -c1 -W1 "$0" >/dev/null 2>&1 && echo "$0"' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+    HOST_IPS=(); HOST_NAMES=(); HOST_MACS=()
+    local ip
+    for ip in "${alive[@]}"; do
+        [[ -n $ip ]] || continue
+        HOST_IPS+=("$ip")
+        HOST_NAMES+=("")
+        HOST_MACS+=("$(neigh_mac "$ip")")
+    done
+}
+
+sweep_tcp() {
+    local cidr=$1
+    local -a ips=() alive=()
+    if ! tcp_usable; then
+        bad "TCP connect probes are unreliable here: even TEST-NET addresses look open."
+        note "Run this on the real laptop, or use nmap with raw-socket access."
+        return 1
+    fi
+    mapfile -t ips < <(cidr_hosts "$cidr" 1024)
+    info "TCP-probing ${#ips[@]} addresses (22/80/443/445/3389/8080)..."
+    mapfile -t alive < <(printf '%s\n' "${ips[@]}" | xargs -P 64 -n 1 bash -c 'tcp_probe "$0" && echo "$0"' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n)
+    HOST_IPS=(); HOST_NAMES=(); HOST_MACS=()
+    local ip
+    for ip in "${alive[@]}"; do
+        [[ -n $ip ]] || continue
+        HOST_IPS+=("$ip")
+        HOST_NAMES+=("")
+        HOST_MACS+=("$(neigh_mac "$ip")")
+    done
+    note "TCP sweep only finds hosts with one of those ports open."
+}
+
+show_hosts() {
+    local i mac m vendor name
+    printf '\n  %-16s %-22s %-19s %s\n' "IP" "HOSTNAME" "MAC" "VENDOR"
+    printf '  %s\n' "--------------------------------------------------------------------------------"
+    for i in "${!HOST_IPS[@]}"; do
+        mac=${HOST_MACS[i]:-}
+        name=${HOST_NAMES[i]:--}
+        m=${mac%% *}
+        vendor=""
+        if [[ $mac == *"("* ]]; then
+            vendor=${mac#*(}
+            vendor=${vendor%)}
+        fi
+        printf '  %-16s %-22s %-19s %s\n' "${HOST_IPS[i]}" "${name:--}" "${m:--}" "$vendor"
+        md "| \`${HOST_IPS[i]}\` | ${name:--} | ${m:--} | $vendor |"
+    done
+    printf '\n'
+}
+
+resolve_targets() {
+    local input=$1 tok
+    input=${input//,/ }
+    for tok in $input; do
+        if [[ $tok =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#HOST_IPS[@]} )); then
+            printf '%s\n' "${HOST_IPS[tok-1]}"
+        else
+            printf '%s\n' "$tok"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------- scanning
+
+parse_nmap_ports() {
+    local file=$1 out=$2 port state svc rest
+    while read -r port state svc rest; do
+        [[ $state == open ]] || continue
+        printf '%s\t%s\t%s\n' "$port" "$svc" "$rest" >> "$out"
+    done < <(grep -E '^[0-9]+/(tcp|udp)[[:space:]]+open' "$file" 2>/dev/null)
+}
+
+fallback_scan() {
+    local target=$1 pf=$2 p svc
+    warn "nmap cannot run here (raw sockets unavailable); using TCP connect checks."
+    if ! tcp_usable; then
+        bad "TCP connect probes are unreliable here: even TEST-NET addresses look open."
+        note "Run this on the real laptop, or install nmap with raw-socket access."
+        return 1
+    fi
+    note "Trying ${#COMMON_PORTS[@]} common ports — no version detection."
+    for p in "${COMMON_PORTS[@]}"; do
+        if port_open "$target" "$p" 1; then
+            svc=$(port_service "$p")
+            printf '%s\t%s\t%s\n' "$p/tcp" "$svc" "(connect scan)" >> "$pf"
+            printf '  %-12s %-10s %s\n' "$p/tcp" "$svc" "(connect scan)"
+        fi
+    done
+}
+
+print_ports() {
+    local target=$1 pf=$2
+    local port svc ver num sev why count=0 highs=0 meds=0
+    echo
+    if [[ ! -s $pf ]]; then
+        warn "No open TCP ports found (or the host filtered the scan)."
+        md "_No open ports found._"
+        return 0
+    fi
+    printf '  %-12s %-12s %s\n' "PORT" "SERVICE" "VERSION / BANNER"
+    printf '  %s\n' "--------------------------------------------------------------"
+    while IFS=$'\t' read -r port svc ver; do
+        count=$((count + 1))
+        printf '  %-12s %-12s %s\n' "$port" "${svc:-?}" "${ver:-(no banner)}"
+        md "- \`$port\` ${svc:-?} ${ver}"
+        num=${port%%/*}
+        IFS='|' read -r sev why <<< "$(port_risk "$num")"
+        case $sev in
+            HIGH)
+                highs=$((highs + 1))
+                bad "    HIGH: $why"
+                add_finding "HIGH" "$target: $port ${svc:-open}" "$why"
+                ;;
+            MEDIUM)
+                meds=$((meds + 1))
+                warn "    CHECK: $why"
+                add_finding "MEDIUM" "$target: $port ${svc:-open}" "$why"
+                ;;
+        esac
+    done < "$pf"
+    echo
+    info "$count open port(s)."
+    if (( highs > 0 )); then
+        bad "Verdict: this host exposes something that should be fixed."
+    elif (( meds > 0 )); then
+        warn "Verdict: usable, but tighten the items marked CHECK."
+    else
+        good "Verdict: nothing obviously risky from the outside."
+    fi
+}
+
+scan_host() {
+    local target=$1
+    [[ $target != */* ]] && LAST_SCAN_HOST=$target
+    local base="$OUT/scan-$(safe "$target")"
+    local pf="$OUT/ports-$(safe "$target").tsv"
+    : > "$pf"
+
+    h2 "Scanning $target"
+    md ""
+    md "### Scan: $target"
+
+    if nmap_usable; then
+        local -a args=(-Pn -sV --version-light -T3 --max-retries 2)
+        if (( FULL_SCAN )); then
+            warn "Full 65535-port scan: this can take a very long time."
+            confirm "Continue with the full scan?" || return 1
+            args+=(-p-)
+        elif [[ -n $PORTS_ARG ]]; then
+            args+=(-p "$PORTS_ARG")
+        else
+            args+=(--top-ports 100)
+        fi
+        info "Running nmap with version detection — this is the slow part."
+        run_show nmap "${args[@]}" -oN "$base.nmap" -oG "$base.gnmap" "$target"
+        parse_nmap_ports "$base.nmap" "$pf"
+        [[ $target == */* ]] && note "Range scan: the port list is aggregated; per-host detail is in $base.nmap"
+    else
+        if ! fallback_scan "$target" "$pf"; then
+            md "_Port scan could not run here (no raw sockets / unreliable TCP probes)._"
+            add_finding "INFO" "Port scan of $target could not run" \
+                "nmap needs raw sockets; run netcheck on the laptop, not in the sandbox."
+            return 1
+        fi
+    fi
+
+    print_ports "$target" "$pf"
+}
+
+# ---------------------------------------------------------------- checks
+
+ssh_check() {
+    local host=$1 host_only out methods fp first
+    host_only=${host#*@}
+    h2 "SSH on $host:22"
+    out=$(timeout 12 ssh -o BatchMode=yes -o ConnectTimeout=5 \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o PreferredAuthentications=none "netcheck@$host_only" 2>&1)
+    if [[ $out =~ Permission\ denied\ \(([^\)]+)\) ]]; then
+        methods=${BASH_REMATCH[1]}
+        info "Accepted auth methods: $methods"
+        md "- SSH auth methods: $methods"
+        if [[ $methods == *password* ]]; then
+            warn "Password authentication is enabled."
+            add_finding "MEDIUM" "SSH on $host accepts passwords" \
+                "Brute-forceable; prefer keys, disable PasswordAuthentication, add fail2ban."
+        fi
+    elif [[ $out == *"Connection refused"* ]]; then
+        info "Port 22 is closed now (it may have been filtered during the scan)."
+    elif [[ $out == *"timed out"* || $out == *"No route"* ]]; then
+        warn "SSH did not answer."
+    else
+        first=$(printf '%s\n' "$out" | head -3)
+        note "$first"
+    fi
+
+    fp=$(timeout 8 ssh-keyscan -T 5 "$host_only" 2>/dev/null | ssh-keygen -lf - 2>/dev/null | head -3)
+    if [[ -n $fp ]]; then
+        h2 "Host key fingerprints"
+        printf '%s\n' "$fp" | sed 's/^/  /'
+        md "- Host keys: $(printf '%s' "$fp" | tr '\n' ';')"
+    fi
+}
+
+tls_check() {
+    local host=$1 port=$2 pem cert proto subj iss nb na days
+    h2 "TLS on $host:$port"
+    pem=$(timeout 10 openssl s_client -connect "$host:$port" -servername "$host" </dev/null 2>/dev/null)
+    if [[ -z $pem ]]; then
+        warn "No TLS handshake."
+        return 0
+    fi
+    proto=$(printf '%s\n' "$pem" | awk -F': ' '/^ *Protocol *:/ {gsub(/ /,"",$2); print $2; exit}')
+    cert=$(printf '%s\n' "$pem" | awk '/BEGIN CERTIFICATE/ {f=1} f {print} /END CERTIFICATE/ {exit}')
+    [[ -n $proto ]] && kv "Protocol" "$proto"
+    [[ $proto == TLSv1 || $proto == TLSv1.1 ]] && {
+        bad "Obsolete TLS version: $proto"
+        add_finding "HIGH" "$host:$port supports $proto" "Obsolete TLS; require TLS 1.2 or newer."
+    }
+    if [[ -n $cert ]]; then
+        subj=$(printf '%s\n' "$cert" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject=//')
+        iss=$(printf '%s\n' "$cert" | openssl x509 -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+        nb=$(printf '%s\n' "$cert" | openssl x509 -noout -startdate 2>/dev/null | sed 's/^notBefore=//')
+        na=$(printf '%s\n' "$cert" | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
+        kv "Subject" "$subj"
+        kv "Issuer" "$iss"
+        kv "Valid" "$nb → $na"
+        md "- TLS $proto, subject \`$subj\`, issuer \`$iss\`, expires $na"
+        if [[ -n $na ]]; then
+            local end now secs
+            end=$(date -d "$na" +%s 2>/dev/null || true)
+            now=$(date +%s)
+            if [[ -n $end ]]; then
+                secs=$((end - now))
+                days=$((secs / 86400))
+                if (( secs < 0 )); then
+                    bad "Certificate expired $(( -secs / 86400 )) day(s) ago."
+                    add_finding "HIGH" "$host:$port certificate expired" "Clients will refuse or warn."
+                elif (( secs < 86400 )); then
+                    warn "Certificate expires in $((secs / 3600)) hour(s)."
+                    add_finding "MEDIUM" "$host:$port certificate expires within a day" "Renew before it breaks clients."
+                elif (( days < 30 )); then
+                    warn "Certificate expires in $days day(s)."
+                    add_finding "MEDIUM" "$host:$port certificate expires in $days days" "Renew before it breaks clients."
+                else
+                    good "Certificate valid for another $days day(s)."
+                fi
+            fi
+        fi
+        if [[ $subj == "$iss" || $iss == *[Ss]elf* ]]; then
+            warn "Self-signed certificate."
+            add_finding "INFO" "$host:$port uses a self-signed certificate" "Expected on routers; do not trust it for public services."
+        fi
+    fi
+}
+
+http_check() {
+    local host=$1 port=$2 scheme=http hdr code server missing=""
+    [[ $port == 443 || $port == 8443 ]] && scheme=https
+    h2 "HTTP on $scheme://$host:$port"
+    hdr=$(curl -sSIk --max-time 8 "$scheme://$host:$port/" 2>/dev/null)
+    if [[ -z $hdr ]]; then
+        warn "No HTTP response."
+        return 0
+    fi
+    code=$(printf '%s\n' "$hdr" | awk 'NR==1 {print $2}')
+    server=$(printf '%s\n' "$hdr" | awk -F': ' 'tolower($1)=="server" {print $2; exit}')
+    kv "Status" "${code:-?}"
+    [[ -n $server ]] && kv "Server" "$server"
+    md "- HTTP $scheme:$port → ${code:-?} (server: ${server:-unknown})"
+    if [[ $scheme == http ]]; then
+        local loc
+        loc=$(printf '%s\n' "$hdr" | awk -F': ' 'tolower($1)=="location" {print $2; exit}')
+        if [[ -n $loc ]]; then
+            info "Redirects to: $loc"
+        else
+            warn "Plain HTTP with no redirect to HTTPS."
+        fi
+    else
+        for h in strict-transport-security content-security-policy x-frame-options x-content-type-options; do
+            printf '%s\n' "$hdr" | grep -qi "^$h:" || missing+="$h "
+        done
+        [[ -n $missing ]] && note "Missing security headers: $missing"
+    fi
+    if [[ -n $server ]] && [[ $server =~ (Apache/2\.[0-4]|nginx/1\.[0-9]\.|IIS/6|IIS/7) ]]; then
+        warn "Old web server banner: $server"
+        add_finding "MEDIUM" "$host:$port runs an old web server" "Banner: $server — check for known CVEs."
+    fi
+}
+
+dns_check() {
+    local host=$1 out
+    h2 "DNS on $host:53"
+    if ! have dig; then
+        note "dig not installed (pacman -S bind); skipping the open-resolver test."
+        return 0
+    fi
+    out=$(timeout 6 dig +time=2 +tries=1 +short @"$host" example.com A 2>/dev/null)
+    if [[ -n $out ]]; then
+        warn "Answers recursive queries — possible open resolver."
+        printf '%s\n' "$out" | sed 's/^/    /'
+        add_finding "MEDIUM" "$host is an open DNS resolver" "Can be abused for amplification attacks; restrict recursion."
+    else
+        good "Refuses recursion (or unreachable) — good."
+    fi
+}
+
+router_ui_check() {
+    local host=$1 port=$2 title
+    h2 "Gateway web interface"
+    title=$(curl -sk --max-time 8 "http://$host:$port/" 2>/dev/null | grep -oiP '<title>\K[^<]+' | head -1)
+    if [[ -n $title ]]; then
+        kv "Page title" "$title"
+        note "Check the admin password; default credentials are common on travel routers."
+        add_finding "INFO" "Gateway admin UI reachable at http://$host:$port" "Change default credentials and disable remote admin."
+    else
+        note "No title found (login page or non-HTML)."
+    fi
+}
+
+# ---------------------------------------------------------------- steps
+
+step_identity() {
+    h1 "1. Where am I?"
+    info "What this machine is, what addresses it holds, and how it reaches the world."
+    md "## 1. Host and interfaces"
+    echo
+    kv "Host" "$(my_hostname)"
+    kv "User" "$(id -un 2>/dev/null) (uid $(id -u))"
+    kv "System" "$(uname -srm)"
+    kv "Time" "$(date '+%Y-%m-%d %H:%M:%S %Z (%z)')"
+    kv "Uptime" "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+
+    h2 "Interfaces and addresses"
+    if ip -brief addr >/dev/null 2>&1; then
+        run_show ip -brief addr
+    else
+        run_show ip addr
+    fi
+    run_show ip -brief link
+
+    h2 "Routes"
+    run_show ip route
+    local gw
+    gw=$(get_gateway)
+    if [[ -n $gw ]]; then
+        good "Default gateway: $gw"
+        md "- Gateway: \`$gw\`"
+    else
+        warn "No IPv4 default route — captive portal, VPN-only link, or DHCP failed."
+        add_finding "MEDIUM" "No IPv4 default route" "You may be stuck behind a captive portal or a broken DHCP lease."
+    fi
+
+    h2 "DNS resolvers"
+    if [[ -r /etc/resolv.conf ]]; then
+        awk '/^nameserver/ {print "  " $2}' /etc/resolv.conf | head -5
+        md "- DNS: $(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf)"
+    else
+        warn "Cannot read /etc/resolv.conf."
+    fi
+
+    h2 "Subnets"
+    local iface cidr
+    while read -r iface cidr; do
+        [[ -z $cidr ]] && continue
+        kv "$iface" "$cidr"
+        md "- \`$iface\` $cidr"
+    done < <(get_subnets)
+
+    if have ss; then
+        local socks
+        socks=$(ss -tulpn 2>/dev/null)
+        if [[ $(printf '%s\n' "$socks" | wc -l) -gt 1 ]]; then
+            h2 "What this machine is listening on"
+            printf '%s\n' "$socks"
+            printf '\n$ ss -tulpn\n%s\n' "$socks" >> "$RAW"
+        else
+            note "No listening sockets visible here (container permissions); skipping."
+        fi
+    fi
+}
+
+step_link() {
+    h1 "2. Link and Wi-Fi"
+    info "How this machine is attached, and how good the signal is."
+    md "## 2. Link and Wi-Fi"
+
+    local wif="" d
+    for d in /sys/class/net/*; do
+        [[ -e "$d/wireless" ]] && wif=${d##*/} && break
+    done
+    if [[ -z $wif ]] && have iw; then
+        wif=$(iw dev 2>/dev/null | awk '/Interface/ {print $2; exit}')
+    fi
+
+    if [[ -n $wif ]]; then
+        kv "Wireless interface" "$wif"
+        md "- Wireless interface: \`$wif\`"
+        if have iw; then
+            run_show iw dev "$wif" link
+            local sig
+            sig=$(iw dev "$wif" link 2>/dev/null | awk '/signal:/ {print $2; exit}')
+            [[ -n $sig ]] && md "- Signal: $sig dBm"
+            if [[ -n $sig ]]; then
+                if (( sig > -60 )); then
+                    good "Signal $sig dBm — strong."
+                elif (( sig > -70 )); then
+                    warn "Signal $sig dBm — usable."
+                else
+                    bad "Signal $sig dBm — weak; expect drops."
+                fi
+            fi
+        else
+            note "iw not installed (pacman -S iw); cannot read signal or channel."
+        fi
+    else
+        warn "No wireless interface visible to Linux (container, or you are on Ethernet)."
+    fi
+
+    if have nmcli; then
+        h2 "Nearby Wi-Fi (NetworkManager)"
+        run_show nmcli -f IN-USE,SSID,SIGNAL,CHAN,SECURITY device wifi list
+    fi
+
+    h2 "Wired links"
+    local found=0
+    for d in /sys/class/net/*; do
+        local name=${d##*/}
+        [[ $name == lo || -e "$d/wireless" ]] && continue
+        if [[ -r $d/carrier ]] && [[ $(cat "$d/carrier" 2>/dev/null) == 1 ]]; then
+            found=1
+            kv "$name" "carrier up ($(cat "$d/operstate" 2>/dev/null))"
+            md "- Wired: \`$name\` carrier up"
+            if have ethtool; then
+                ethtool "$name" 2>/dev/null | awk -F': ' '/Speed|Duplex/ {print "    " $1 ": " $2}'
+            fi
+        fi
+    done
+    (( found )) || note "No wired link with carrier detected."
+}
+
+step_discover() {
+    h1 "3. Who else is on this network?"
+    info "Passive first (the kernel's neighbour table), then a light active sweep."
+    md "## 3. Hosts on the network"
+
+    h2 "Neighbour table (passive)"
+    run_show ip neigh
+    echo
+
+    local cidr=${SUBNET_ARG:-}
+    if [[ -z $cidr ]]; then
+        local primary
+        primary=$(primary_subnet)
+        cidr=$(ask "Subnet to sweep" "${primary:-}") || return
+    fi
+    if [[ -z $cidr ]]; then
+        warn "No subnet to scan."
+        return
+    fi
+    [[ $cidr == */* ]] || cidr="$cidr/24"
+    kv "Target" "$cidr"
+
+    confirm "Send an active sweep to $cidr?" || return
+
+    local method=""
+    if nmap_usable; then
+        method=nmap
+        info "Using nmap host discovery."
+        run_show nmap -sn -n --max-retries 1 --host-timeout 10s -oG "$OUT/discovery.gnmap" "$cidr"
+        parse_discovery "$OUT/discovery.gnmap"
+    elif ping_usable; then
+        method=ping
+        info "nmap not usable; using parallel ping."
+        sweep_ping "$cidr"
+    else
+        warn "Neither nmap nor ping can send raw packets here."
+        if ! tcp_usable; then
+            bad "TCP connect probes are unreliable in this sandbox (even TEST-NET looks open)."
+            note "Host discovery needs nmap or ping with raw-socket access — run this on the laptop."
+            return
+        fi
+        if confirm "Use a TCP connect sweep of common ports instead? (slower, noisier)"; then
+            method=tcp
+            sweep_tcp "$cidr"
+        else
+            return
+        fi
+    fi
+
+    if ((${#HOST_IPS[@]} == 0)); then
+        warn "No hosts answered."
+        if [[ $method != tcp ]] && confirm "Try a TCP connect sweep of common ports?"; then
+            method=tcp
+            sweep_tcp "$cidr"
+        fi
+    fi
+
+    fill_names
+    if ((${#HOST_IPS[@]})); then
+        md ""
+        md "| IP | Hostname | MAC | Vendor |"
+        md "|---|---|---|---|"
+        show_hosts
+        good "${#HOST_IPS[@]} host(s) responded."
+    fi
+}
+
+step_path() {
+    h1 "4. Is the path out healthy?"
+    info "Gateway, DNS, internet, MTU and captive portal — the usual travel failures."
+    md "## 4. Path and connectivity"
+
+    local gw
+    gw=$(get_gateway)
+    md "- Gateway: ${gw:-none}"
+    if [[ -z $gw ]]; then
+        bad "No default gateway to test."
+    else
+        h2 "Gateway $gw"
+        if ping_usable; then
+            run_show ping -c 3 -W 2 "$gw"
+        elif tcp_usable; then
+            if port_open "$gw" 80 2 || port_open "$gw" 443 2 || port_open "$gw" 53 2; then
+                good "Gateway answers on TCP (ICMP is not available here)."
+            else
+                warn "Gateway did not answer ICMP or common TCP ports."
+            fi
+        else
+            note "ICMP unavailable and TCP probes unreliable here — cannot test the gateway."
+        fi
+    fi
+
+    h2 "DNS"
+    if timeout 5 getent hosts example.com >/dev/null 2>&1; then
+        good "example.com resolves."
+        md "- DNS: resolves"
+    else
+        bad "DNS resolution failed."
+        md "- DNS: **failed**"
+        add_finding "HIGH" "DNS resolution failed" "No names resolve; check resolv.conf, DHCP and the gateway's DNS."
+    fi
+    if have dig; then
+        run_show dig +time=2 +tries=1 example.com A +short
+    else
+        note "dig not installed (pacman -S bind) — skipping detailed DNS output."
+    fi
+
+    h2 "Internet"
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://example.com 2>/dev/null || true)
+    if [[ $code =~ ^[23] ]]; then
+        good "HTTPS to example.com works (HTTP $code)."
+        md "- HTTPS egress: works (HTTP $code)"
+    else
+        warn "HTTPS check returned ${code:-no response}."
+        md "- HTTPS egress: **failed** (${code:-no response})"
+        add_finding "HIGH" "HTTPS to the internet failed" "Egress may be blocked, filtered or behind a portal."
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 http://connectivitycheck.gstatic.com/generate_204 2>/dev/null || true)
+    if [[ $code == 204 ]]; then
+        good "No captive portal detected."
+        md "- Captive portal: no"
+    else
+        warn "Captive portal or filtering in the way (HTTP ${code:-none})."
+        md "- Captive portal: **suspected** (HTTP ${code:-none})"
+        add_finding "MEDIUM" "Captive portal suspected" "Sign in through the browser before trusting the link."
+    fi
+
+    if ping_usable && [[ -n $gw ]]; then
+        h2 "MTU to the gateway"
+        local size mtu=""
+        for size in 1472 1400 1300 1200; do
+            if ping -c 1 -W 2 -M do -s "$size" "$gw" >/dev/null 2>&1; then
+                mtu=$((size + 28))
+                break
+            fi
+        done
+        if [[ -n $mtu ]]; then
+            good "Path MTU: at least $mtu bytes."
+            md "- Path MTU: at least $mtu bytes"
+        else
+            warn "Even 1228-byte probes fail; VPN or PPPoE in the path?"
+            md "- Path MTU: below 1228 bytes"
+        fi
+    fi
+
+    h2 "Path"
+    local can_trace=0
+    if ping_usable; then
+        if [[ -n $gw ]] && ping -c 1 -W 1 "$gw" >/dev/null 2>&1; then
+            can_trace=1
+        elif ping -c 1 -W 1 1.1.1.1 >/dev/null 2>&1; then
+            can_trace=1
+        fi
+    fi
+    if (( ! can_trace )); then
+        note "Skipping traceroute: no ICMP path to probe from here."
+    elif have traceroute; then
+        run_show timeout -k 2 25 traceroute -n -w 1 -q 1 -m 6 1.1.1.1
+    elif have tracepath; then
+        run_show timeout -k 2 25 tracepath -n -m 6 1.1.1.1
+    else
+        note "No traceroute or tracepath installed."
+    fi
+
+    if [[ -t 0 ]] && confirm "Look up the public IP (one request to ifconfig.co)?"; then
+        local pub
+        pub=$(curl -s --max-time 8 https://ifconfig.co 2>/dev/null)
+        if [[ -n $pub ]]; then
+            kv "Public IP" "$pub"
+            md "- Public IP: \`$pub\`"
+        else
+            warn "Could not determine the public IP."
+        fi
+    fi
+}
+
+step_ports() {
+    h1 "5. What is exposed?"
+    info "Port scan with version detection. Default: the 100 most common TCP ports."
+    md "## 5. Exposed services"
+
+    if ((${#HOST_IPS[@]})); then
+        h2 "Hosts found earlier"
+        local i
+        for i in "${!HOST_IPS[@]}"; do
+            printf '  %2d) %-15s %-22s %s\n' "$((i + 1))" "${HOST_IPS[i]}" "${HOST_NAMES[i]:--}" "${HOST_MACS[i]:-}"
+        done
+    fi
+
+    local default_target=${TARGET_ARG:-}
+    [[ -z $default_target ]] && default_target=$(get_gateway)
+    [[ -z $default_target ]] && default_target=${HOST_IPS[0]:-}
+    if [[ -z $default_target ]]; then
+        warn "No gateway or host known yet — run step 3 first, or pass --target."
+        return
+    fi
+
+    local input
+    input=$(ask "Scan which? (number, IP or CIDR; space-separated)" "$default_target") || return
+    [[ -n $input ]] || return
+
+    local -a targets=()
+    mapfile -t targets < <(resolve_targets "$input")
+    local t size
+    for t in "${targets[@]}"; do
+        [[ -n $t ]] || continue
+        if [[ $t == */* ]]; then
+            size=$(cidr_size "$t")
+            if (( size > 16 )); then
+                warn "$t contains up to $size addresses."
+                confirm "Scan all of them?" || continue
+            fi
+        fi
+        scan_host "$t"
+    done
+}
+
+step_security() {
+    h1 "6. Is it secure?"
+    info "TLS, HTTP, SSH and risky services on one host."
+    md "## 6. Security spot-checks"
+
+    local default_host=${TARGET_ARG:-}
+    [[ -z $default_host ]] && default_host=${LAST_SCAN_HOST:-}
+    [[ -z $default_host ]] && default_host=$(get_gateway)
+    [[ -z $default_host ]] && default_host=${HOST_IPS[0]:-}
+    if [[ -z $default_host ]]; then
+        warn "No host to check — run step 5 first."
+        return
+    fi
+
+    local input host
+    input=$(ask "Which host should I check?" "$default_host") || return
+    host=$(resolve_targets "$input" | head -1)
+    host=${host#*@}
+    [[ -n $host ]] || return
+
+    local pf="$OUT/ports-$(safe "$host").tsv"
+    if [[ ! -s $pf ]]; then
+        info "No scan on file for $host — scanning it first."
+        scan_host "$host"
+    fi
+    if [[ ! -s $pf ]]; then
+        warn "No open ports found; nothing to probe."
+        return
+    fi
+
+    local port svc ver num
+    while IFS=$'\t' read -r port svc ver; do
+        num=${port%%/*}
+        case $num in
+            22) ssh_check "$host" ;;
+            443|8443|993|995|465|636) tls_check "$host" "$num" ;;
+            80|8000|8080|8888)
+                http_check "$host" "$num"
+                if [[ $host == "$(get_gateway)" ]]; then
+                    router_ui_check "$host" "$num"
+                fi
+                ;;
+            53) dns_check "$host" ;;
+        esac
+    done < "$pf"
+
+    # Anything risky that the scan already flagged is in the findings list.
+    local highs=0 meds=0 f sev
+    for f in "${FINDINGS[@]:-}"; do
+        sev=${f%%|*}
+        [[ $sev == HIGH ]] && highs=$((highs + 1))
+        [[ $sev == MEDIUM ]] && meds=$((meds + 1))
+    done
+    echo
+    if (( highs > 0 )); then
+        bad "Overall: $highs high-severity finding(s) — fix before trusting this host."
+    elif (( meds > 0 )); then
+        warn "Overall: $meds medium-severity finding(s) — usable, but tighten it."
+    else
+        good "Overall: nothing obvious from the outside."
+    fi
+}
+
+step_ssh() {
+    h1 "7. SSH toolbox"
+    info "Fingerprints, auth methods, and a way in."
+    md "## 7. SSH"
+
+    local -a conf_hosts=()
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        mapfile -t conf_hosts < <(awk 'tolower($1)=="host" {for (i=2;i<=NF;i++) if ($i !~ /[*?!]/) print $i}' "$HOME/.ssh/config" | sort -u)
+    fi
+
+    h2 "Hosts in ~/.ssh/config"
+    if ((${#conf_hosts[@]})); then
+        printf '%s\n' "${conf_hosts[@]}" | sed 's/^/  /'
+    else
+        note "No concrete Host entries."
+    fi
+
+    h2 "Local keys"
+    local k found=0
+    for k in "$HOME"/.ssh/*.pub; do
+        [[ -e $k ]] || continue
+        found=1
+        printf '  %s\n' "${k##*/}"
+        ssh-keygen -lf "$k" 2>/dev/null | sed 's/^/    /'
+    done
+    (( found )) || note "No public keys in ~/.ssh."
+    if have ssh-add; then
+        ssh-add -l 2>/dev/null | sed 's/^/  agent: /' || note "ssh-agent has no keys loaded."
+    fi
+
+    local default_target=${TARGET_ARG:-}
+    [[ -z $default_target ]] && default_target=${conf_hosts[0]:-}
+    [[ -z $default_target ]] && default_target=$(get_gateway)
+    [[ -z $default_target ]] && default_target=${HOST_IPS[0]:-}
+    if [[ -z $default_target ]]; then
+        warn "No target known."
+        return
+    fi
+
+    local input target
+    input=$(ask "SSH target (number, user@host or a config name)" "$default_target") || return
+    target=$(resolve_targets "$input" | head -1)
+    [[ -n $target ]] || return
+    md "- Target: \`$target\`"
+
+    ssh_check "$target"
+
+    if (( ! INTERACTIVE )); then
+        return 0
+    fi
+
+    while :; do
+        echo
+        printf '  %s[a]%s probe again   %s[c]%s connect   %s[k]%s install my key   %s[b]%s back\n' \
+            "$B" "$RST" "$B" "$RST" "$B" "$RST" "$B" "$RST"
+        local action
+        read -rp "  ${B}Action${RST} [b]: " action || return
+        case ${action:-b} in
+            a|A) ssh_check "$target" ;;
+            c|C)
+                info "Opening an interactive session. Type 'exit' to come back."
+                ssh -o ConnectTimeout=10 "$target"
+                ;;
+            k|K)
+                if ! have ssh-copy-id; then
+                    warn "ssh-copy-id not installed (part of openssh)."
+                    continue
+                fi
+                if ! ls "$HOME"/.ssh/*.pub >/dev/null 2>&1; then
+                    warn "No public key yet."
+                    confirm "Generate an ed25519 key now?" || continue
+                    ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N ""
+                fi
+                ssh-copy-id "$target"
+                ;;
+            b|B|"") return ;;
+            *) warn "Unknown action: $action" ;;
+        esac
+    done
+}
+
+step_report() {
+    h1 "8. Write the report"
+    write_report
+    good "Report written."
+    kv "Markdown" "$REPORT"
+    kv "Raw log" "$RAW"
+    REPORT_PRINTED=1
+}
+
+# ---------------------------------------------------------------- menu
+
+menu_status() {
+    local sub gw
+    sub=$(primary_subnet)
+    gw=$(get_gateway)
+    printf '  %shost:%s %s   %snet:%s %s   %sgw:%s %s   %shosts:%s %d   %sfindings:%s %d\n' \
+        "$DIM" "$RST" "$(my_hostname)" \
+        "$DIM" "$RST" "${sub:-none}" \
+        "$DIM" "$RST" "${gw:-none}" \
+        "$DIM" "$RST" "${#HOST_IPS[@]}" \
+        "$DIM" "$RST" "${#FINDINGS[@]}"
+}
+
+main_menu() {
+    while :; do
+        echo
+        hr
+        menu_status
+        cat <<'MENU'
+  1) Where am I?              host, addresses, routes, DNS, listening ports
+  2) Link and Wi-Fi           SSID, signal, channel, link speed
+  3) Who is on this network?  neighbours + active sweep
+  4) Is the path healthy?     gateway, DNS, internet, MTU, captive portal
+  5) What is exposed?         port + version scan
+  6) Is it secure?            TLS, HTTP, SSH, risky services
+  7) SSH toolbox              fingerprints, auth probe, connect
+  8) Write the report
+  a) Run the whole checklist
+  q) Quit
+MENU
+        local choice
+        read -rp "  ${B}Choice${RST}: " choice || break
+        case $choice in
+            1|2|3|4|5|6|7|8) run_step "$choice" ;;
+            a|A) local i; for i in 1 2 3 4 5 6 7; do run_step "$i"; done ;;
+            q|Q) break ;;
+            "") ;;
+            *) warn "Unknown choice: $choice" ;;
+        esac
+    done
+}
+
+run_step() {
+    case $1 in
+        1) step_identity ;;
+        2) step_link ;;
+        3) step_discover ;;
+        4) step_path ;;
+        5) step_ports ;;
+        6) step_security ;;
+        7) step_ssh ;;
+        8) step_report ;;
+        *) warn "No such step: $1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- startup
+
+check_deps() {
+    local -a miss=() pkgs=()
+    local c dim_line
+    for c in nmap dig traceroute iw nmcli ethtool ss; do
+        have "$c" || miss+=("$c")
+    done
+    ((${#miss[@]})) || return 0
+    note "Tools not installed: ${miss[*]}"
+    if have pacman; then
+        for c in "${miss[@]}"; do
+            case $c in
+                dig) pkgs+=(bind) ;;
+                nmcli) pkgs+=(networkmanager) ;;
+                ss) pkgs+=(iproute2) ;;
+                *) pkgs+=("$c") ;;
+            esac
+        done
+        dim_line="  install with: pacman -S ${pkgs[*]}"
+        printf '%s%s%s\n' "$DIM" "$dim_line" "$RST"
+    fi
+}
+
+usage() {
+    cat <<EOF
+$SELF $VERSION — field checklist for a network you just met
+
+Usage:
+  $SELF                     interactive checklist
+  $SELF --all               run steps 1-7 without prompts
+  $SELF --quick             steps 1-4 only
+  $SELF --step N            run one step (1-8)
+  $SELF --target HOST       default target for steps 5, 6 and 7
+  $SELF --subnet CIDR       default subnet for step 3
+  $SELF --ports SPEC        nmap -p value for step 5 (e.g. 1-1024)
+  $SELF --full              scan all 65535 TCP ports in step 5 (slow)
+  $SELF --yes               assume yes for confirmations
+  $SELF --no-color          plain output
+  $SELF --out DIR           report base directory (default: ~/netcheck-reports)
+  $SELF --version           print version
+  $SELF --help              this text
+
+Steps:
+  1 host + interfaces   2 link/Wi-Fi       3 host discovery
+  4 path/DNS/portal     5 port scan        6 TLS/HTTP/SSH checks
+  7 SSH toolbox         8 write report
+
+Reports are written to ~/netcheck-reports/<timestamp>-<pid>/report.md.
+Only scan networks you own or have permission to test.
+EOF
+}
+
+parse_args() {
+    while (($#)); do
+        case $1 in
+            -h|--help) usage; exit 0 ;;
+            -V|--version) printf '%s %s\n' "$SELF" "$VERSION"; exit 0 ;;
+            -a|--all) RUN_ALL=1 ;;
+            -q|--quick) QUICK=1 ;;
+            -s|--step) STEP_ARG=${2:-}; shift ;;
+            -t|--target) TARGET_ARG=${2:-}; shift ;;
+            --subnet) SUBNET_ARG=${2:-}; shift ;;
+            --ports) PORTS_ARG=${2:-}; shift ;;
+            --full) FULL_SCAN=1 ;;
+            -y|--yes) ASSUME_YES=1 ;;
+            --no-color) USE_COLOR=0 ;;
+            --out) REPORT_ROOT=${2:-}; shift ;;
+            *)
+                printf 'Unknown option: %s\n\n' "$1" >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+
+main() {
+    parse_args "$@"
+    setup_colors
+    init_report
+    banner
+    check_deps
+
+    if [[ -n $STEP_ARG ]]; then
+        run_step "$STEP_ARG"
+    elif (( RUN_ALL )); then
+        local i
+        for i in 1 2 3 4 5 6 7; do run_step "$i"; done
+    elif (( QUICK )); then
+        local i
+        for i in 1 2 3 4; do run_step "$i"; done
+    else
+        if [[ ! -t 0 ]]; then
+            printf 'No terminal for the interactive menu. Use --all, --quick or --step N.\n' >&2
+            usage >&2
+            exit 1
+        fi
+        INTERACTIVE=1
+        main_menu
+    fi
+}
+
+trap finalize_report EXIT
+main "$@"
